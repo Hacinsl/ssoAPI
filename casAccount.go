@@ -10,13 +10,33 @@ import (
 	"github.com/mxschmitt/playwright-go"
 )
 
-func fetchTicket(opt *TicketOptions) *TicketResp {
-	resp := &TicketResp{}
+// CasOptions 是一次 CAS 认证的参数。
+type CasOptions struct {
+	Service  string   // Service 是 CAS 的 service 参数，登录成功后 CAS 会带着 ticket 跳回该地址。
+	Account  string   // Account 是学工号 / 账号；用 SourceID 换票时可以留空。
+	Password string   // Password 是密码；用 SourceID 换票时可以留空。
+	SourceID string   // SourceID 是已有的 SOURCEID_TGC，用于免密码换票。
+	Passkey  KeyStore // PassKey 是通行密钥。
+}
+
+// CasResp 是一次 CAS 认证的结果。
+type CasResp struct {
+	Ticket    string   // Ticket 是 CAS 票据，一次性有效，与 Service 绑定。
+	Session   string   // Session 是一次认证的会话 ID，会话期间内有效，与 Service 绑定。
+	SourceID  string   // SourceID 是本次登录拿到的 SOURCEID_TGC，长期有效，与 Service 无关。
+	Passkey   KeyStore // PassKey 是通行密钥，永久有效，与 Service 无关。
+	Location  *url.URL // Location 是 CAS 认证后302重定向到的地址。
+	Execution *string  // Execution 是 CAS flowExecutionKey，与 Session 绑定，因此亦与 Service 绑定。
+}
+
+// 通过 Playwright 启动真实浏览器进行认证，以绕过登录页风控。
+// 使用 CasOption 中的 Account/Password，返回有效 SourceID/Ticket。
+func casWithAccount(opt *CasOptions) (*CasResp, error) {
+	resp := &CasResp{}
 
 	session, err := newPwSession()
 	if err != nil {
-		resp.Err = fmt.Errorf("Failed to fetch ticket: %s", err)
-		return resp
+		return nil, fmt.Errorf("Failed to fetch ticket: %w", err)
 	}
 	defer session.Close()
 	page := session.page
@@ -35,29 +55,25 @@ func fetchTicket(opt *TicketOptions) *TicketResp {
 
 	loginURL, err := loginPageURL(opt.Service)
 	if err != nil {
-		resp.Err = fmt.Errorf("Failed to build login page url: %s", err)
-		return resp
+		return nil, fmt.Errorf("Failed to build login page url: %w", err)
 	}
 
 	if _, err := page.Goto(loginURL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(10000),
 	}); err != nil {
-		resp.Err = fmt.Errorf("Failed to open login page: %s", err)
-		return resp
+		return nil, fmt.Errorf("Failed to open login page: %w", err)
 	}
 
 	if err := fillLoginForm(page, opt); err != nil {
-		resp.Err = fmt.Errorf("Failed to autofill: %s", err)
-		return resp
+		return nil, fmt.Errorf("Failed to autofill: %w", err)
 	}
 
 	// 停止丢弃cookie收集
 	closeDropResp()
 
 	if err := submitLogin(page); err != nil {
-		resp.Err = fmt.Errorf("Failed to submit login: %s", err)
-		return resp
+		return nil, fmt.Errorf("Failed to submit login: %w", err)
 	}
 
 	timeout := 15 * time.Second
@@ -76,8 +92,7 @@ waitLoop:
 		case resp.Ticket = <-ticketCh:
 			haveTicket = true
 		case <-deadlineCh:
-			resp.Err = fmt.Errorf("Timed out.")
-			break waitLoop
+			return nil, fmt.Errorf("Timed out.")
 		}
 
 		// ticket与cookie都收集到
@@ -86,7 +101,7 @@ waitLoop:
 		}
 	}
 
-	return resp
+	return resp, nil
 }
 
 // allowedHosts 是登录流程必须放行的主机名，逐字精确匹配，不做任何子域推导：
@@ -178,7 +193,7 @@ func submitLogin(page playwright.Page) error {
 	return lastErr
 }
 
-func fillLoginForm(page playwright.Page, opt *TicketOptions) error {
+func fillLoginForm(page playwright.Page, opt *CasOptions) error {
 	userSelectors := []string{
 		`#nameInput`,
 		`input#nameInput[name="username"]`,
