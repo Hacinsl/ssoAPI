@@ -1,3 +1,5 @@
+github.com/Hacinsl/httpUtils v0.1.0 h1:jNh1I8Y/qJftBa7CGalcrNuRfPR+GbOecA7WPOaUUB8=
+github.com/Hacinsl/httpUtils v0.1.0/go.mod h1:gyX8N2yDM2uzqcgIfXaT5BkcgTavtAop07H3LnVnE44=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/deckarep/golang-set/v2 v2.8.0 h1:swm0rlPCmdWn9mESxKOjWk8hXSqoxOp+ZlfuyaAdFlQ=

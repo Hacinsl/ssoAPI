@@ -4,7 +4,7 @@
 
 ## 用法
 
-- `GetTicketWithAccount()` 通过账号密码完成 CAS 认证。若给定`CasOptions.Service`，则返回`CasResp.SourceID`与对应服务的`CasResp.Ticket`，否则返回`CasResp.SourceID`与 sso-self 的`CasResp.Ticket`。
+- `GetTicketWithAccount()` 通过账号密码完成 CAS 认证。返回`CasResp.SourceID`与对应服务的`CasResp.Ticket`。
 - `GetTicketWithTgc()` 通过有效`CasOptions.SourceID`完成 CAS 认证。返回对应服务的`CasResp.Ticket`。
 - `GetPasskeyWithTgc()` 通过有效`CasOptions.SourceID`完成 Passkey 注册。返回`CasResp.Passkey`。
 - `GetTgcWithPasskey()` 通过有效`CasOptions.Passkey`完成 CAS 认证。返回`CasResp.SourceID`。

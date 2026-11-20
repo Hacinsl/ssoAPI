@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
+	"strconv"
 
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,6 +20,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"strings"
+
+	httputils "github.com/Hacinsl/httpUtils"
 )
 
 // parseRSAPublicKey 把 PEM 形式的 PKIX 公钥解析成 *rsa.PublicKey。
@@ -85,7 +89,7 @@ func aesDecrypt(s []byte, key []byte) string {
 }
 
 func getPublicKey() (*rsa.PublicKey, error) {
-	js, err := doGetHtml("https://sso.ecnu.edu.cn/public/webauthJs/webauthn.js?v=2.0.1",
+	js, err := httputils.GetHtml("https://sso.ecnu.edu.cn/public/webauthJs/webauthn.js?v=2.0.1",
 		&map[string]string{
 			"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0",
 		},
@@ -118,23 +122,50 @@ func buildAuthenticatorDataForGet(rpID string, signCount uint32) []byte {
 	return buf
 }
 
+// parseSignCountMismatch 从 finish 响应的 messages 中解析出服务端期望的最小计数器值。
+// 命中时返回 (expected, received, true)。
+func parseSignCountMismatch(messages []string) (expected, received int, ok bool) {
+	for _, m := range messages {
+		if !strings.Contains(m, "Signature counter must increase") {
+			continue
+		}
+		if sub := regexp.MustCompile(`Expected minimum:\s*(\d+)`).FindStringSubmatch(m); len(sub) == 2 {
+			if v, err := strconv.Atoi(sub[1]); err == nil {
+				expected = v
+				ok = true
+			}
+		}
+		if sub := regexp.MustCompile(`received value:\s*(\d+)`).FindStringSubmatch(m); len(sub) == 2 {
+			if v, err := strconv.Atoi(sub[1]); err == nil {
+				received = v
+			}
+		}
+	}
+	return expected, received, ok
+}
+
 // 在 Passkey 已经被使用的情况下，即使最终返回了 error，认证次数也已经被更新，所以调用者需要检查返回值是否为空，若不为空则利用返回值更新 Passkey。
 func loginPasskey(opt *CasOptions) (*CasResp, error) {
+	logInfo("Start loginPasskey: Username = %s, SignCount = %d", opt.Passkey.Username, opt.Passkey.SignCount)
 	executionResp, err := casWithNothing()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Account, err)
+		logError("Failed to login for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Passkey.Username, err)
 	}
 	loginRsaPubKey, err := getPublicKey()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Account, err)
+		logError("Failed to login for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Passkey.Username, err)
 	}
+	logDebug("Get login rsa public key.")
 
 	random := make([]byte, 16)
 	rand.Read(random)
 	ct, _ := rsa.EncryptPKCS1v15(rand.Reader, loginRsaPubKey, []byte(base64.StdEncoding.EncodeToString(random)))
 
-	usernameData, _ := json.Marshal(map[string]string{"username": opt.Account})
-	r, err := doPostBytes("https://sso.ecnu.edu.cn/webauthn/authenticate",
+	usernameData, _ := json.Marshal(map[string]string{"username": opt.Passkey.Username})
+	logDebug("Request webauthn authenticate for %s.", opt.Passkey.Username)
+	r, err := httputils.PostBytes("https://sso.ecnu.edu.cn/webauthn/authenticate",
 		[]byte(base64.StdEncoding.EncodeToString(aesEncrypt(string(usernameData), random))), nil,
 		&map[string]string{
 			"Content-Type": "application/json",
@@ -145,18 +176,26 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Account, err)
+		logError("Failed to login for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Passkey.Username, err)
 	}
 
 	decodeR, err := base64.StdEncoding.DecodeString(string(*r))
 	if err != nil {
+		logError("Failed to decode response base64: %s", err)
 		return nil, fmt.Errorf("Failed to decode response base64: %w", err)
 	}
 	decR := aesDecrypt(decodeR, random)
 	authResp := new(authenticateResp)
 	if err = json.Unmarshal([]byte(decR), authResp); err != nil {
+		logError("Failed to unmarshal response: %s", err)
 		return nil, fmt.Errorf("Failed to unmarshal response: %w", err)
 	}
+	logDebug("Get webauthn requestId: %s", authResp.Request.RequestID)
+
+	passKeyCountRetried := false
+
+SignCountRetry:
 
 	authData := buildAuthenticatorDataForGet(opt.Passkey.RpId, uint32(opt.Passkey.SignCount+1))
 	clientData, _ := json.Marshal(map[string]any{
@@ -171,9 +210,11 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 	toSign = append(toSign, digest[:]...)
 	signKey, err := parseEd25519PrivateKey(opt.Passkey.PrivateKeyPem)
 	if err != nil {
+		logError("Failed to parse passkey private key: %s", err)
 		return nil, fmt.Errorf("Failed to parse passkey private key: %w", err)
 	}
 	signatureData := ed25519.Sign(signKey, toSign)
+	logDebug("Sign assertion with SignCount = %d", opt.Passkey.SignCount+1)
 
 	response := map[string]any{
 		"authenticatorData": base64.RawURLEncoding.EncodeToString(authData),
@@ -188,12 +229,15 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 		"clientExtensionResults": map[string]interface{}{},
 	}
 
-	finishResp, err := doPostJSON[finishResp]("https://sso.ecnu.edu.cn/webauthn/authenticate/finish",
+	finishData, err := json.Marshal(
 		&map[string]interface{}{
 			"requestId":    authResp.Request.RequestID,
 			"credential":   credential,
 			"sessionToken": authResp.Request.SessionToken,
-		}, nil,
+		},
+	)
+	finishRespResp, err := httputils.PostResp("https://sso.ecnu.edu.cn/webauthn/authenticate/finish", finishData,
+		nil,
 		&map[string]string{
 			"User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0",
 			"X-CSRF-TOKEN": "csrfToken",
@@ -201,17 +245,57 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 			"Origin":       "https://sso.ecnu.edu.cn",
 		},
 	)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Account, err)
+	// 非 2xx/3xx 时库会同时返回响应与错误，此时仍尽力解析响应体，以取回服务端的错误信息。
+	if err != nil && finishRespResp == nil {
+		logError("Failed to login for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to login for %s: %w", opt.Passkey.Username, err)
 	}
+	if err != nil {
+		logWarn("Unexpected status when finishing login for %s: %s", opt.Passkey.Username, err)
+	}
+
+	finishRespData, err := io.ReadAll(finishRespResp.Body)
+	if err != nil {
+		logError("Failed to read response for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to read response for %s: %w", opt.Passkey.Username, err)
+	}
+	finishResp := new(finishResp)
+	err = json.Unmarshal(finishRespData, finishResp)
+	if err != nil {
+		logError("Failed to unmarshal response for %s: %s", opt.Passkey.Username, err)
+		return nil, fmt.Errorf("Failed to unmarshal response for %s: %w", opt.Passkey.Username, err)
+	}
+
 	if !finishResp.Success {
-		return nil, fmt.Errorf("Failed to login for %s: Server returns failure", opt.Account)
+		var finishErrMsg struct {
+			Messages []string `json:"messages"`
+		}
+		_ = json.Unmarshal(finishRespData, &finishErrMsg)
+
+		if expected, received, matched := parseSignCountMismatch(finishErrMsg.Messages); EnablePasskeyAutoAddCount && matched {
+			if passKeyCountRetried {
+				logError("Failed to login for %s: sign counter mismatch, expected %d, received %d, retries exhausted",
+					opt.Passkey.Username, expected, received)
+				return nil, fmt.Errorf("Failed to login for %s: sign counter mismatch, expected %d, received %d, retries exhausted",
+					opt.Passkey.Username, expected, received)
+			}
+			passKeyCountRetried = true
+			// 服务端要求“下一次”签名计数 >= expected，而 buildAuthenticatorDataForGet 用的是 SignCount+1，所以这里设为 expected-1
+			opt.Passkey.SignCount = expected - 1
+			logWarn("Sign counter mismatch for %s, expected %d, received %d, retry with SignCount = %d",
+				opt.Passkey.Username, expected, received, opt.Passkey.SignCount)
+			goto SignCountRetry
+		}
+
+		logError("Failed to login for %s: Server returns failure: %v", opt.Passkey.Username, finishErrMsg.Messages)
+		return nil, fmt.Errorf("Failed to login for %s: Server returns failure: %v",
+			opt.Passkey.Username, finishErrMsg.Messages)
 	}
 
 	casResp := CasResp{Passkey: opt.Passkey}
 	casResp.Passkey.SignCount++
 
-	loginRespCookies, err := doPostCookie("https://sso.ecnu.edu.cn/login",
+	loginRespCookies, err := httputils.PostCookie("https://sso.ecnu.edu.cn/login",
 		url.Values{
 			"username":    {opt.Passkey.Username},
 			"token":       {finishResp.SessionToken},
@@ -226,7 +310,8 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 		},
 	)
 	if err != nil {
-		return &casResp, fmt.Errorf("Failed to login for %s: %w", opt.Account, err)
+		logError("Failed to login for %s: %s", opt.Passkey.Username, err)
+		return &casResp, fmt.Errorf("Failed to login for %s: %w", opt.Passkey.Username, err)
 	}
 
 	for _, c := range loginRespCookies {
@@ -239,9 +324,11 @@ func loginPasskey(opt *CasOptions) (*CasResp, error) {
 	for _, c := range loginRespCookies {
 		if c.Name == "SOURCEID_TGC" {
 			casResp.SourceID = c.Value
+			logInfo("Get CasResp: SourceID = %s, Session = %s, SignCount = %d", casResp.SourceID, casResp.Session, casResp.Passkey.SignCount)
 			return &casResp, nil
 		}
 	}
 
-	return &casResp, fmt.Errorf("Failed to login for %s: Can not find SOURCEID_TGC", opt.Account)
+	logError("Failed to login for %s: Can not find SOURCEID_TGC", opt.Passkey.Username)
+	return &casResp, fmt.Errorf("Failed to login for %s: Can not find SOURCEID_TGC", opt.Passkey.Username)
 }

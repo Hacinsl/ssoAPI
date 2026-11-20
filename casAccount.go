@@ -32,10 +32,12 @@ type CasResp struct {
 // 通过 Playwright 启动真实浏览器进行认证，以绕过登录页风控。
 // 使用 CasOption 中的 Account/Password，返回有效 SourceID/Ticket。
 func casWithAccount(opt *CasOptions) (*CasResp, error) {
+	logInfo("Start casWithAccount: Account = %s, Password = %s", opt.Account, opt.Password)
 	resp := &CasResp{}
 
 	session, err := newPwSession()
 	if err != nil {
+		logError("Failed to fetch ticket: %s", err)
 		return nil, fmt.Errorf("Failed to fetch ticket: %w", err)
 	}
 	defer session.Close()
@@ -44,39 +46,53 @@ func casWithAccount(opt *CasOptions) (*CasResp, error) {
 	// 两个 channel 的发送端都跑在 playwright 的 dispatch goroutine 上，一旦阻塞就会连命令回复都无法投递，因此一律用非阻塞发送。
 	ticketCh := watchTicket(page)
 	respCh := watchSourceId(page)
+	watchLog(page) // 添加日志
 
 	stop := make(chan struct{})
 	var once sync.Once
 	closeDropResp := func() {
-		once.Do(func() { close(stop) }) // defer与手动关闭同时存在，这里保证仅关闭一次。
+		logInfo("Playwright: Try to stop dropping cookies.")
+		once.Do(func() {
+			logInfo("Playwright: Stop to dropping cookies.")
+			close(stop)
+		}) // defer与手动关闭同时存在，这里保证仅关闭一次。
 	}
 	defer closeDropResp()
+	logInfo("Playwright: Start dropping cookies.")
 	go dropResps(respCh, stop) // 在提交登录表单前丢弃response防止cookie丢失。
 
 	loginURL, err := loginPageURL(opt.Service)
 	if err != nil {
+		logError("Failed to build login page url: %s", err)
 		return nil, fmt.Errorf("Failed to build login page url: %w", err)
 	}
+	logInfo("Use login URL: %s", loginURL)
 
 	if _, err := page.Goto(loginURL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		Timeout:   playwright.Float(10000),
 	}); err != nil {
+		logError("Failed to open login page: %s", err)
 		return nil, fmt.Errorf("Failed to open login page: %w", err)
 	}
 
+	logInfo("Start filling login form.")
 	if err := fillLoginForm(page, opt); err != nil {
+		logError("Failed to autofill: %s", err)
 		return nil, fmt.Errorf("Failed to autofill: %w", err)
 	}
 
 	// 停止丢弃cookie收集
 	closeDropResp()
 
+	logInfo("Start submiting login.")
 	if err := submitLogin(page); err != nil {
+		logError("Failed to submit login: %s", err)
 		return nil, fmt.Errorf("Failed to submit login: %w", err)
 	}
 
 	timeout := 15 * time.Second
+	logDebug("Wait ticket or cookie within %s.", timeout)
 	deadlineCh := time.After(timeout)
 
 	var haveTicket, haveSourceID bool
@@ -85,22 +101,28 @@ waitLoop:
 	for {
 		select {
 		case respWithCookie := <-respCh:
+			logDebug("Playwright: Cookie channel get msg.")
 			if sourceId, ok := sourceIDTGC(respWithCookie); ok {
+				logInfo("Get cookie SOURCEID_TGC: %s", sourceId)
 				resp.SourceID = sourceId
 				haveSourceID = true
 			}
 		case resp.Ticket = <-ticketCh:
+			logDebug("Playwright: Ticket channel get msg.")
+			logInfo("Get Ticket: %s", resp.Ticket)
 			haveTicket = true
 		case <-deadlineCh:
+			logError("Wait cookie or ticket time out.")
 			return nil, fmt.Errorf("Timed out.")
 		}
 
 		// ticket与cookie都收集到
 		if haveTicket && haveSourceID {
+			logInfo("Both ticket and cookie collected.")
 			break waitLoop
 		}
 	}
-
+	logInfo("Get CasResp: SourceID = %s, Ticket = %s", resp.SourceID, resp.Ticket)
 	return resp, nil
 }
 
@@ -123,6 +145,27 @@ func hostResolverRules() string {
 	return "--host-resolver-rules=" + strings.Join(rules, ", ")
 }
 
+func watchLog(page playwright.Page) {
+	page.OnRequest(func(r playwright.Request) {
+		headers, _ := r.AllHeaders()
+		body, _ := r.PostData()
+		logDebug("Playwright: Request URL %s", r.URL())
+		logDebug("Playwright: Request Headers %v", headers)
+		logDebug("Playwright: Request Body %s", body)
+	})
+	page.OnResponse(func(r playwright.Response) {
+		headers, _ := r.AllHeaders()
+		body, err := r.Body()
+		if err != nil {
+			logDebug("Playwright: Response Body error %s", err)
+			return
+		}
+		logDebug("Playwright: Response URL %d %s", r.Status(), r.URL())
+		logDebug("Playwright: Response Headers %v", headers)
+		logDebug("Playwright: Response Body %s", body)
+	})
+}
+
 func watchTicket(page playwright.Page) <-chan string {
 	ticketCh := make(chan string, 1)
 	page.OnRequest(func(r playwright.Request) {
@@ -132,7 +175,9 @@ func watchTicket(page playwright.Page) <-chan string {
 		}
 		select {
 		case ticketCh <- ticket:
+			logDebug("Playwright: Ticket channel send msg.")
 		default: // 已经收到过 ticket，丢弃
+			logDebug("Playwright: Ticket channel full, drop msg.")
 		}
 	})
 	return ticketCh
@@ -145,6 +190,7 @@ func watchSourceId(page playwright.Page) chan playwright.Response {
 		select {
 		case respCh <- r:
 		default: // 队列已满，丢弃
+			logDebug("Playwright: Response channel full, drop msg.")
 		}
 	})
 	return respCh
@@ -154,15 +200,19 @@ func watchSourceId(page playwright.Page) chan playwright.Response {
 func loginPageURL(service string) (string, error) {
 	u, err := url.Parse("https://sso.ecnu.edu.cn/login")
 	if err != nil {
+		logError("Failed to parse login url: %s", err)
 		return "", err
 	}
 	q := u.Query()
 	q.Set("service", service)
 	u.RawQuery = q.Encode()
+	logDebug("Build login URL for service %s: %s", service, u.String())
 	return u.String(), nil
 }
 
 func dropResps(ch chan playwright.Response, stop <-chan struct{}) {
+	logDebug("Playwright: Start dropResps.")
+	defer logDebug("Playwright: Stop dropResps.")
 	for {
 		select {
 		case <-stop:
@@ -185,11 +235,14 @@ func submitLogin(page playwright.Page) error {
 	var lastErr error
 	for _, sel := range submitSelectors {
 		if err := page.Locator(sel).Click(playwright.LocatorClickOptions{Timeout: playwright.Float(1500)}); err != nil {
+			logDebug("Submit selector failed: %s", sel)
 			lastErr = err
 			continue
 		}
+		logDebug("Submit with selector: %s", sel)
 		return nil
 	}
+	logError("All submit selectors failed: %s", lastErr)
 	return lastErr
 }
 
@@ -205,9 +258,12 @@ func fillLoginForm(page playwright.Page, opt *CasOptions) error {
 	}
 	userSel, err := waitAnyVisible(page, userSelectors, 10*time.Second)
 	if err != nil {
+		logError("Failed to find username input: %s", err)
 		return fmt.Errorf("Failed to find username input: %s", err)
 	}
+	logDebug("Use username selector: %s", userSel)
 	if err := page.Locator(userSel).Fill(opt.Account); err != nil {
+		logError("Failed to fill username: %s", err)
 		return fmt.Errorf("Failed to fill username: %s", err)
 	}
 
@@ -221,9 +277,12 @@ func fillLoginForm(page playwright.Page, opt *CasOptions) error {
 	}
 	passSel, err := waitAnyVisible(page, passSelectors, 10*time.Second)
 	if err != nil {
+		logError("Failed to find password input: %s", err)
 		return fmt.Errorf("Failed to find password input: %s", err)
 	}
+	logDebug("Use password selector: %s", passSel)
 	if err := page.Locator(passSel).Fill(opt.Password); err != nil {
+		logError("Failed to fill password: %s", err)
 		return fmt.Errorf("Failed to fill password: %s", err)
 	}
 
@@ -244,12 +303,14 @@ func waitAnyVisible(page playwright.Page, selectors []string, timeout time.Durat
 			}
 		}
 	}
+	logDebug("Wait any visible timed out after %s", timeout)
 	return "", fmt.Errorf("Timed out.")
 }
 
 func matchTicket(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
+		logDebug("Failed to parse request url %s: %s", rawURL, err)
 		return ""
 	}
 	q := u.Query()
@@ -260,6 +321,7 @@ func matchTicket(rawURL string) string {
 func sourceIDTGC(resp playwright.Response) (string, bool) {
 	values, err := resp.HeaderValues("set-cookie")
 	if err != nil {
+		logDebug("Failed to get set-cookie header: %s", err)
 		return "", false
 	}
 
@@ -292,6 +354,7 @@ type pwSession struct {
 }
 
 func (s *pwSession) Close() {
+	logDebug("Close playwright session.")
 	if s.page != nil {
 		_ = s.page.Close()
 	}
@@ -307,8 +370,10 @@ func (s *pwSession) Close() {
 }
 
 func newPwSession() (*pwSession, error) {
+	logInfo("Start newPwSession.")
 	pw, err := playwright.Run()
 	if err != nil {
+		logError("Failed to start playwright: %s", err)
 		return nil, fmt.Errorf("Failed to start playwright: %s", err)
 	}
 	session := &pwSession{pw: pw}
@@ -321,8 +386,10 @@ func newPwSession() (*pwSession, error) {
 		hostResolverRules(), // 在网络层启用白名单，过滤其他域名，防止ticket被提前消费。
 	}
 	if noSandbox {
+		logDebug("Run browser with --no-sandbox.")
 		launchArgs = append(launchArgs, "--no-sandbox", "--disable-dev-shm-usage")
 	}
+	logDebug("Playwright launch args: %v", launchArgs)
 	launchOpts := playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(true),
 		Args:     launchArgs,
@@ -330,6 +397,7 @@ func newPwSession() (*pwSession, error) {
 
 	browser, err := pw.Chromium.Launch(launchOpts)
 	if err != nil {
+		logError("Failed to launch browser: %s", err)
 		_ = pw.Stop()
 		return nil, fmt.Errorf("Failed to launch browser: %s", err)
 	}
@@ -342,6 +410,7 @@ func newPwSession() (*pwSession, error) {
 	}
 	ctx, err := browser.NewContext(ctxOpts)
 	if err != nil {
+		logError("Failed to create browser context: %s", err)
 		session.Close()
 		return nil, fmt.Errorf("Failed to create browser context: %s", err)
 	}
@@ -349,9 +418,11 @@ func newPwSession() (*pwSession, error) {
 
 	page, err := ctx.NewPage()
 	if err != nil {
+		logError("Failed to create page: %s", err)
 		session.Close()
 		return nil, fmt.Errorf("Failed to create page: %s", err)
 	}
 	session.page = page
+	logInfo("Playwright session ready.")
 	return session, nil
 }

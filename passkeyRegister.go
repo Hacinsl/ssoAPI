@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"time"
 
+	httputils "github.com/Hacinsl/httpUtils"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -73,20 +74,25 @@ func serializePrivateKeyPEM(priv any) string {
 
 // 以 Data 结尾的变量默认类型为 byte[]
 func registerPasskey(opt *CasOptions) (*CasResp, error) {
+	logInfo("Start registerPasskey: Account = %s, SourceID = %s", opt.Account, opt.SourceID)
 	var key KeyStore
 	key.Username = opt.Account
 	key.DeviceName = "ssoAPI" + time.Now().Format("2006-01-02_15-04-05")
 	key.BaseUrl = "https://sso.ecnu.edu.cn/"
 	key.SignCount = 0
+	logDebug("Register device name: %s", key.DeviceName)
 
 	// 注册通行密钥需要一个登录态 SSO Session。
 	casResp, err := casWithTgc(opt)
 	if err != nil {
+		logError("Failed to register for %s: %s", opt.Account, err)
 		return nil, fmt.Errorf("Failed to register for %s: %w", opt.Account, err)
 	}
+	logDebug("Get SESSION for register: %s", casResp.Session)
 
 	// 必须先加载管理页，否则 register 会返回 operation not allowed。
-	resp, err := doGetResp("https://sso.ecnu.edu.cn/account?skipCustom=true", nil,
+	logDebug("Load passkey management page.")
+	resp, err := httputils.GetResp("https://sso.ecnu.edu.cn/account?skipCustom=true", nil,
 		&map[string]string{
 			"SOURCEID_TGC": opt.SourceID,
 			"SESSION":      casResp.Session,
@@ -97,13 +103,17 @@ func registerPasskey(opt *CasOptions) (*CasResp, error) {
 		},
 	)
 	if err != nil {
+		logError("Failed to load passkey management page: %s", err)
 		return nil, fmt.Errorf("Failed to load passkey management page: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		logError("Failed to load passkey management page: unexpected status %d", resp.StatusCode)
 		return nil, fmt.Errorf("Failed to load passkey management page: unexpected status %d", resp.StatusCode)
 	}
+	logDebug("Passkey management page status: %d", resp.StatusCode)
 
-	r, err := doPostForm[registerResp]("https://sso.ecnu.edu.cn/webauthn/register",
+	logDebug("Request webauthn register for %s.", opt.Account)
+	r, err := httputils.PostForm[registerResp]("https://sso.ecnu.edu.cn/webauthn/register",
 		&url.Values{
 			"username":           {opt.Account},
 			"displayName":        {opt.Account},
@@ -125,11 +135,13 @@ func registerPasskey(opt *CasOptions) (*CasResp, error) {
 		},
 	)
 	if err != nil {
+		logError("Failed to register for %s: %s", opt.Account, err)
 		return nil, fmt.Errorf("Failed to register for %s: %w", opt.Account, err)
 	}
 	key.RpId = r.Request.PublicKeyCredentialCreationOptions.RP.ID
 	key.UserId = r.Request.PublicKeyCredentialCreationOptions.User.ID
 	key.Alg = -8
+	logDebug("Get register requestId: %s, rpId: %s", r.Request.RequestID, key.RpId)
 
 	random := make([]byte, 32)
 	rand.Read(random)
@@ -164,7 +176,7 @@ func registerPasskey(opt *CasOptions) (*CasResp, error) {
 		"clientExtensionResults": map[string]any{},
 	}
 
-	f, err := doPostJSON[finishResp]("https://sso.ecnu.edu.cn/webauthn/register/finish",
+	f, err := httputils.PostJSON[finishResp]("https://sso.ecnu.edu.cn/webauthn/register/finish",
 		&map[string]interface{}{
 			"requestId":    r.Request.RequestID,
 			"credential":   credential,
@@ -184,13 +196,16 @@ func registerPasskey(opt *CasOptions) (*CasResp, error) {
 		},
 	)
 	if err != nil {
+		logError("Failed to finish registration for %s: %s", opt.Account, err)
 		return nil, fmt.Errorf("Failed to finish registration for %s: %w", opt.Account, err)
 	}
 	if f.Success != true {
+		logError("Failed to finish registration for %s: server rejected the credential", opt.Account)
 		return nil, fmt.Errorf("Failed to finish registration for %s: server rejected the credential", opt.Account)
 	}
 
 	key.CreateAt = time.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
+	logInfo("Get CasResp: CredentialId = %s, RpId = %s, CreateAt = %s", key.CredentialId, key.RpId, key.CreateAt)
 
 	return &CasResp{Passkey: key}, nil
 }

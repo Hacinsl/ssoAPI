@@ -3,6 +3,7 @@ module github.com/Hacinsl/ssoAPI
 go 1.26.4
 
 require (
+	github.com/Hacinsl/httpUtils v0.1.0
 	github.com/fxamacker/cbor/v2 v2.10.0
 	github.com/mxschmitt/playwright-go v0.6201.1
 )
